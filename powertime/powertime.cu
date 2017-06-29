@@ -11,7 +11,7 @@
 #define NCHAN_COARSE 336
 #define NCHAN_FINE_IN 32
 #define NCHAN_FINE_OUT 27
-#define NACCUMULATE 256
+#define NACCUMULATE 128 
 #define NPOL 2
 #define NSAMPS 4
 #define NCHAN_SUM 16
@@ -49,6 +49,74 @@ __global__ void unpack_original_tex(cudaTextureObject_t texObj, cufftComplex * _
             out[skip + chanidx * YSIZE * 2 + YSIZE + sample].y = static_cast<float>(static_cast<short>(((word.x & 0xff00) >> 8) | ((word.x & 0xff) << 8)));
         }
     }
+}
+
+
+__global__ void unpack_new(const unsigned int *__restrict__ in, cufftComplex * __restrict__ out, unsigned int acc)
+{
+
+    int chanidx = threadIdx.x + blockIdx.y * 7;
+    int skip = 128 * NACCUMULATE * 336;
+    int word;
+
+    int warpidx = threadIdx.x >> 5;
+    int laneidx = threadIdx.x & 0x1f;
+
+    int instart = blockIdx.x * 8 * NCHAN_COARSE * YSIZE;
+    int outstart = blockIdx.x * YSIZE;
+
+    __shared__ unsigned int accblock[1792];
+
+    
+    int fpgaidx = 0;
+
+/*    for (int icoarse = 0; icoarse < 336; ++icoarse) {
+        fpgaidx = icoarse / 48;
+ 	accblock[] = in[instart + icoarse * blockIdx.x + threadIdx.x]; 
+    }
+*/
+    int inoffset = 0;
+    int chan = 0;
+    int time = 0;
+    int byte = 0;
+
+    int line = 0;
+
+    cufftComplex pola, polb;
+
+    int polaint;
+    int polbint;
+
+    for (int iacc = 0; iacc < NACCUMULATE; ++iacc) {
+
+        for (int iblock = 0; iblock < XSIZE; ++iblock) {
+            line = iblock * blockIdx.x + threadIdx.x;
+            chan = line % 7;
+            time = line / 7;
+            accblock[chan * 128 * 2 + time * 2 + 0] = in[line * 2 + 0];
+            accblock[chan * 128 * 2 + time * 2 + 1] = in[line * 2 + 1];
+
+        }
+
+        for (int ichan = 0; ichan < 7; ichan++) {
+            polaint = accblock[ichan * 128 * 2 + threadIdx.x * 2 + 1];
+            polbint = accblock[ichan * 128 * 2 + threadIdx.x * 2 + 0];
+            pola.x = static_cast<float>(static_cast<short>( ((polaint & 0xff000000) >> 24) | ((polaint & 0xff0000) >> 8) ));
+            pola.y = static_cast<float>(static_cast<short>( ((polaint & 0xff00) >> 8) | ((polaint & 0xff) << 8) )); 
+	    
+            polb.x = static_cast<float>(static_cast<short>( ((polbint & 0xff000000) >> 24) | ((polbint & 0xff0000) >> 8) ));
+            polb.y = static_cast<float>(static_cast<short>( ((polbint & 0xff00) >> 8) | ((polbint & 0xff) << 8) )); 
+            
+            out[blockIdx.x * 7 * 128 * NACCUMULATE + ichan * 128 * NACCUMULATE + iacc * 128 + threadIdx.x] = pola;  
+            out[blockIdx.x * 7 * 128 * NACCUMULATE + ichan * 128 * NACCUMULATE + iacc * 128 + threadIdx.x + skip] = polb;  
+        }
+
+    } 
+
+
+
+    __syncthreads();
+
 }
 
 __global__ void powertime_original(cuComplex* __restrict__ in,
@@ -248,6 +316,7 @@ int main()
     cudaTextureObject_t texObj = 0;
     cudaCreateTextureObject(&texObj, &rdesc, &tdesc, NULL);
 
+    thrust::device_vector<unsigned char> rawdata(7148 * 48 * NACCUMULATE);
     thrust::device_vector<cuComplex> input(336*32*4*2*NACCUMULATE);
     thrust::device_vector<float> output(336*27*NACCUMULATE);
 
@@ -256,17 +325,17 @@ int main()
     dim3 rearrange_b(1,48,1);
     dim3 rearrange_t(7,1,1);
 
-    for (int ii=0; ii<1; ++ii) {
+    for (int ii=0; ii<128; ++ii) {
 
         unpack_original_tex<<<rearrange_b, rearrange_t, 0>>>(texObj, thrust::raw_pointer_cast(input.data()), NACCUMULATE);
-        // unpack_new<<<>>>()
-        powertime_original<<<48, 27, 0>>>(thrust::raw_pointer_cast(input.data()),
-        thrust::raw_pointer_cast(output.data()), 864, NSAMPS, NACCUMULATE);
-        powertime_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
-        powertime_new<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()),336,32,27,2,4);
+        unpack_new<<<48, 128, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()), NACCUMULATE);
+        //powertime_original<<<48, 27, 0>>>(thrust::raw_pointer_cast(input.data()),
+        //thrust::raw_pointer_cast(output.data()), 864, NSAMPS, NACCUMULATE);
+        //powertime_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
+        //powertime_new<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()),336,32,27,2,4);
         gpuErrchk(cudaDeviceSynchronize());
-        powertimefreq_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
+        //powertimefreq_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
     }
 
-  //gpuErrchk(cudaDeviceSynchronize());
+  gpuErrchk(cudaDeviceSynchronize());
 }
