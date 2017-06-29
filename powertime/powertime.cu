@@ -2,6 +2,8 @@
 #include "thrust/device_vector.h"
 #include "cuComplex.h"
 
+#include "cufft.h"
+
 #define XSIZE 7
 #define YSIZE 128
 #define ZSIZE 48
@@ -27,6 +29,27 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 //Why isn't this a #define
 __device__ float fftfactor = 1.0/32.0 * 1.0/32.0;
+
+__global__ void unpack_original_tex(cudaTextureObject_t texObj, cufftComplex * __restrict__ out, unsigned int acc)
+{
+
+    int xidx = blockIdx.x * blockDim.x + threadIdx.x;
+    int yidx = blockIdx.y * 128;
+    int chanidx = threadIdx.x + blockIdx.y * 7;
+    int skip;
+    int2 word;
+
+    for (int ac = 0; ac < acc; ac++) {
+        skip = 336 * 128 * 2 * ac;
+        for (int sample = 0; sample < YSIZE; sample++) {
+            word = tex2D<int2>(texObj, xidx, yidx + ac * 48 * 128 + sample);
+            out[skip + chanidx * YSIZE * 2 + sample].x = static_cast<float>(static_cast<short>(((word.y & 0xff000000) >> 24) | ((word.y & 0xff0000) >> 8)));
+            out[skip + chanidx * YSIZE * 2 + sample].y = static_cast<float>(static_cast<short>(((word.y & 0xff00) >> 8) | ((word.y & 0xff) << 8)));
+            out[skip + chanidx * YSIZE * 2 + YSIZE + sample].x = static_cast<float>(static_cast<short>(((word.x & 0xff000000) >> 24) | ((word.x & 0xff0000) >> 8)));
+            out[skip + chanidx * YSIZE * 2 + YSIZE + sample].y = static_cast<float>(static_cast<short>(((word.x & 0xff00) >> 8) | ((word.x & 0xff) << 8)));
+        }
+    }
+}
 
 __global__ void powertime_original(cuComplex* __restrict__ in,
 				   float* __restrict__ out,
@@ -153,7 +176,7 @@ __global__ void powertimefreq_new_hardcoded(
   float* __restrict__ out)
 {
 
-  __shared__ float freq_sum_buffer[NCHAN_FINE_OUT*NCHAN_COARSE]
+  __shared__ float freq_sum_buffer[NCHAN_FINE_OUT*NCHAN_COARSE];
 
   int warp_idx = threadIdx.x >> 0x5;
   int lane_idx = threadIdx.x & 0x1f;
@@ -191,30 +214,59 @@ __global__ void powertimefreq_new_hardcoded(
         if ((start_chan+NCHAN_SUM) > NCHAN_FINE_OUT*NCHAN_COARSE)
           return;
         float sum = freq_sum_buffer[start_chan];
-        for (int ii=0; idx<4; ++idx)
+        for (int ii=0; ii<4; ++ii)
         {
           sum += freq_sum_buffer[start_chan + (1<<ii)];
           __syncthreads();
         }
+        out[out_offset+start_chan/NCHAN_SUM];
       }
-      out[out_offset+start_chan/NCHAN_SUM]
     }
   return;
 }
 
 int main()
 {
-  thrust::device_vector<cuComplex> input(336*32*4*2*NACCUMULATE);
-  thrust::device_vector<float> output(336*27*NACCUMULATE);
-  for (int ii=0; ii<100; ++ii)
-    {
-      powertime_original<<<48, 27, 0>>>(thrust::raw_pointer_cast(input.data()),
+
+    unsigned char *rawbuffer = new unsigned char[7168 * 48 * NACCUMULATE];
+    cudaArray *rawarray;
+    cudaChannelFormatDesc cdesc;
+    cdesc = cudaCreateChannelDesc<int2>();
+    cudaMallocArray(&rawarray, &cdesc, 7,  48 * 128 * NACCUMULATE);
+
+    cudaResourceDesc rdesc;
+    memset(&rdesc, 0, sizeof(cudaResourceDesc));
+    rdesc.resType = cudaResourceTypeArray;
+    rdesc.res.array.array = rawarray;
+
+    cudaTextureDesc tdesc;
+    memset(&tdesc, 0, sizeof(cudaTextureDesc));
+    tdesc.addressMode[0] = cudaAddressModeClamp;
+    tdesc.filterMode = cudaFilterModePoint;
+    tdesc.readMode = cudaReadModeElementType;
+
+    cudaTextureObject_t texObj = 0;
+    cudaCreateTextureObject(&texObj, &rdesc, &tdesc, NULL);
+
+    thrust::device_vector<cuComplex> input(336*32*4*2*NACCUMULATE);
+    thrust::device_vector<float> output(336*27*NACCUMULATE);
+
+    cudaMemcpyToArray(rawarray, 0, 0, rawbuffer, 7168 * 48 * NACCUMULATE * sizeof(unsigned char), cudaMemcpyHostToDevice);
+
+    dim3 rearrange_b(1,48,1);
+    dim3 rearrange_t(7,1,1);
+
+    for (int ii=0; ii<1; ++ii) {
+
+        unpack_original_tex<<<rearrange_b, rearrange_t, 0>>>(texObj, thrust::raw_pointer_cast(input.data()), NACCUMULATE);
+        // unpack_new<<<>>>()
+        powertime_original<<<48, 27, 0>>>(thrust::raw_pointer_cast(input.data()),
         thrust::raw_pointer_cast(output.data()), 864, NSAMPS, NACCUMULATE);
-      powertime_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
-      powertime_new<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()),336,32,27,2,4);
-      gpuErrchk(cudaDeviceSynchronize());
-      powertimefreq_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
+        powertime_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
+        powertime_new<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()),336,32,27,2,4);
+        gpuErrchk(cudaDeviceSynchronize());
+        powertimefreq_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
     }
+
   //gpuErrchk(cudaDeviceSynchronize());
 }
-
