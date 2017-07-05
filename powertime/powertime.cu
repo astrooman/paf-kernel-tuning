@@ -153,6 +153,87 @@ __global__ void unpack_new_new(const unsigned int *__restrict__ in, cufftComplex
 }
 
 
+// NOTE: This implementation considers an alternative receive RAM buffer
+// with NACCUMULATE packets from the first FPGA, followed by NACCUMULATE packets from the second and so on
+
+__global__ void unpack_alt(const unsigned int *__restrict__ in, cufftComplex * __restrict__ out) {
+
+    if (threadIdx.x == 1022 || threadIdx.x == 1023)
+        return; 
+
+    __shared__ unsigned int accblock[2044];
+
+    int inskip = blockIdx.x * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NPOL * NACCUMULATE;
+    int outskip = blockIdx.x * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE;
+
+    int time = 0;
+    int chan = 0;
+
+    cufftComplex pola, polb;
+
+    int polaint;
+    int polbint;
+
+
+    // NOTE: That will leave last 224 lines unprocessed
+    // This can fit in 7 full warps of 32
+    for (int iacc = 0; iacc < 112; ++iacc) {
+
+        chan = threadIdx.x % 7;
+        time = threadIdx.x / 7;        
+ 
+        accblock[chan * 146 + time] = in[inskip + threadIdx.x * NPOL];
+        accblock[NCHAN_PER_PACKET * 146 + chan * 146 + time] = in[inskip + threadIdx.x * NPOL + 1];
+        inskip += 2044;
+        
+        __syncthreads();
+
+        polbint = accblock[threadIdx.x];
+        polaint = accblock[NCHAN_PER_PACKET * 146 + threadIdx.x];
+
+        pola.x = static_cast<float>(static_cast<short>( ((polaint & 0xff000000) >> 24) | ((polaint & 0xff0000) >> 8) ));
+        pola.y = static_cast<float>(static_cast<short>( ((polaint & 0xff00) >> 8) | ((polaint & 0xff) << 8) ));
+
+        polb.x = static_cast<float>(static_cast<short>( ((polbint & 0xff000000) >> 24) | ((polbint & 0xff0000) >> 8) ));
+        polb.y = static_cast<float>(static_cast<short>( ((polbint & 0xff00) >> 8) | ((polbint & 0xff) << 8) ));
+
+        chan = threadIdx.x / 146;
+        time = threadIdx.x % 146; 
+
+        out[outskip + chan * NSAMP_PER_PACKET * NACCUMULATE + time] = pola;
+        out[NCHAN_COARSE * NSAMP_PER_PACKET * NACCUMULATE + outskip + chan * NSAMP_PER_PACKET * NACCUMULATE + time] = polb;
+        outskip += 146;
+    }
+
+    if (threadIdx.x < 224) {
+
+        chan = threadIdx.x % 7;
+        time = threadIdx.x / 7;
+
+        accblock[chan * 32 + time] = in[inskip + threadIdx.x * NPOL];
+        accblock[NCHAN_PER_PACKET * 32 + chan * 32 + time] = in[inskip + threadIdx.x * NPOL + 1];
+
+        __syncthreads();
+
+        polbint = accblock[threadIdx.x];
+        polaint = accblock[NCHAN_PER_PACKET * 32 + threadIdx.x];
+
+        pola.x = static_cast<float>(static_cast<short>( ((polaint & 0xff000000) >> 24) | ((polaint & 0xff0000) >> 8) ));
+        pola.y = static_cast<float>(static_cast<short>( ((polaint & 0xff00) >> 8) | ((polaint & 0xff) << 8) ));
+
+        polb.x = static_cast<float>(static_cast<short>( ((polbint & 0xff000000) >> 24) | ((polbint & 0xff0000) >> 8) ));
+        polb.y = static_cast<float>(static_cast<short>( ((polbint & 0xff00) >> 8) | ((polbint & 0xff) << 8) ));
+
+        chan = threadIdx.x / 32;
+        time = threadIdx.x % 32;
+
+        out[outskip + chan * NSAMP_PER_PACKET * NACCUMULATE + time] = pola;
+        out[NCHAN_COARSE * NSAMP_PER_PACKET * NACCUMULATE + outskip + chan * NSAMP_PER_PACKET * NACCUMULATE + time] = polb;
+        printf("%i", threadIdx.x);
+    }
+        
+}
+
 __global__ void powertime_original(cuComplex* __restrict__ in,
 				   float* __restrict__ out,
 				   unsigned int jump,
@@ -360,12 +441,14 @@ int main()
     dim3 rearrange_t(7,1,1);
 
     dim3 unpackt(2, 128, 1);
+    dim3 unpacka(1, 1024, 1);
 
-    for (int ii=0; ii<16; ++ii) {
+    for (int ii=0; ii<1; ++ii) {
 
         unpack_original_tex<<<rearrange_b, rearrange_t, 0>>>(texObj, thrust::raw_pointer_cast(input.data()), NACCUMULATE);
         unpack_new<<<48, 128, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()), NACCUMULATE);
         unpack_new_new<<<48, unpackt, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()));
+        unpack_alt<<<48, unpacka, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()));
         powertime_original<<<48, 27, 0>>>(thrust::raw_pointer_cast(input.data()),
         thrust::raw_pointer_cast(output.data()), 864, NSAMPS, NACCUMULATE);
         powertime_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
