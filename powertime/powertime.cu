@@ -1,3 +1,5 @@
+#include <fstream>
+#include <iostream>
 #include <stdio.h>
 #include "thrust/device_vector.h"
 #include "cuComplex.h"
@@ -13,12 +15,15 @@
 #define NCHAN_COARSE 336
 #define NCHAN_FINE_IN 32
 #define NCHAN_FINE_OUT 27
-#define NACCUMULATE 128 
+#define NACCUMULATE 1 
 #define NPOL 2
 #define NSAMPS 4
 #define NCHAN_SUM 16
 #define NSAMP_PER_PACKET 128
 #define NCHAN_PER_PACKET 7
+
+using std::cout;
+using std::endl;
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -55,7 +60,7 @@ __global__ void unpack_original_tex(cudaTextureObject_t texObj, cufftComplex * _
 }
 
 
-__global__ void unpack_new(const unsigned int *__restrict__ in, cufftComplex * __restrict__ out, unsigned int acc)
+__global__ void unpack_new(const unsigned int *__restrict__ in, cufftComplex * __restrict__ out)
 {
 
     int skip = 0;
@@ -66,47 +71,127 @@ __global__ void unpack_new(const unsigned int *__restrict__ in, cufftComplex * _
     int time = 0;
     int line = 0;
 
-    cufftComplex pola, polb;
+    cufftComplex cpol;
+    int polint;
+    int2 tmp;
 
-    int polaint;
-    int polbint;
+    int outskip = 0;
 
     for (int iacc = 0; iacc < NACCUMULATE; ++iacc) {
-
-        skip = iacc * NCHAN_COARSE * NSAMP_PER_PACKET * NPOL + blockIdx.x * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NPOL;
-
+        // NOTE: This is skipping whole words as in will be cast to int2
+        skip = iacc * NCHAN_COARSE * NSAMP_PER_PACKET + blockIdx.x * NCHAN_PER_PACKET * NSAMP_PER_PACKET;
+       
         for (int ichunk = 0; ichunk < 7; ++ichunk) {
             line = ichunk * blockDim.x + threadIdx.x;
             chan = line % 7;
             time = line / 7;
-            accblock[chan * NSAMP_PER_PACKET * 2 + time] = in[skip + line * 2 + 0];
-            accblock[chan * NSAMP_PER_PACKET * 2 + NSAMP_PER_PACKET + time] = in[skip + line * 2 + 1];
-
+            tmp = ((int2*)in)[skip + line];
+            accblock[chan * NSAMP_PER_PACKET + time] = tmp.y;
+            accblock[NSAMP_PER_PACKET * NCHAN_PER_PACKET + chan * NSAMP_PER_PACKET + + time] = tmp.x;
         }
 
         __syncthreads();
         
         skip = NCHAN_COARSE * NSAMP_PER_PACKET * NACCUMULATE;
+        
+        outskip = blockIdx.x * 7 * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET;
 
-        for (int ichan = 0; ichan < 7; ichan++) {
-            polaint = accblock[ichan * 128 * 2 + threadIdx.x];
-            polbint = accblock[ichan * 128 * 2 + NSAMP_PER_PACKET + threadIdx.x];
+        for (chan = 0; chan < NCHAN_PER_PACKET; ++chan) {
+            /*polaint = accblock[ichan * NSAMP_PER_PACKET + threadIdx.x];
+            polbint = accblock[NSAMP_PER_PACKET * NCHAN_PER_PACKET + ichan * NSAMP_PER_PACKET + threadIdx.x];
             pola.x = static_cast<float>(static_cast<short>( ((polaint & 0xff000000) >> 24) | ((polaint & 0xff0000) >> 8) ));
             pola.y = static_cast<float>(static_cast<short>( ((polaint & 0xff00) >> 8) | ((polaint & 0xff) << 8) )); 
 	    
             polb.x = static_cast<float>(static_cast<short>( ((polbint & 0xff000000) >> 24) | ((polbint & 0xff0000) >> 8) ));
             polb.y = static_cast<float>(static_cast<short>( ((polbint & 0xff00) >> 8) | ((polbint & 0xff) << 8) )); 
-            
-            out[iacc * NSAMP_PER_PACKET + blockIdx.x * 7 * 128 * NACCUMULATE + ichan * 128 * NACCUMULATE + iacc * 128 + threadIdx.x] = pola;  
-            out[iacc * NSAMP_PER_PACKET + blockIdx.x * 7 * 128 * NACCUMULATE + ichan * 128 * NACCUMULATE + iacc * 128 + threadIdx.x + skip] = polb;  
+            */
+
+            polint = accblock[chan * NSAMP_PER_PACKET + threadIdx.x];
+            cpol.x = static_cast<float>(static_cast<short>( ((polint & 0xff000000) >> 24) | ((polint & 0xff0000) >> 8) ));
+            cpol.y = static_cast<float>(static_cast<short>( ((polint & 0xff00) >> 8) | ((polint & 0xff) << 8) ));
+            out[outskip + threadIdx.x] = cpol;
+
+            polint = accblock[NSAMP_PER_PACKET * NCHAN_PER_PACKET + chan * NSAMP_PER_PACKET + threadIdx.x];
+            cpol.x = static_cast<float>(static_cast<short>( ((polint & 0xff000000) >> 24) | ((polint & 0xff0000) >> 8) ));
+            cpol.y = static_cast<float>(static_cast<short>( ((polint & 0xff00) >> 8) | ((polint & 0xff) << 8) ));
+
+            out[skip + outskip + threadIdx.x] = cpol;
+
+            outskip += NSAMP_PER_PACKET * NACCUMULATE;
+
         }
 
     } 
 
 }
 
+__global__ void unpack_new_b(const unsigned int *__restrict__ in, cufftComplex *__restrict__ out) {
+
+    int skip = 0;
+
+    __shared__ unsigned int accblock[1792];
+
+    int chan = 0;
+    int time = 0;
+    int line = 0;
+
+    cufftComplex cpol;
+    int polint;
+    int2 tmp;
+
+    int outskip = 0;
+
+    for (int iacc = 0; iacc < NACCUMULATE; ++iacc) {
+        // NOTE: This is skipping whole words as in will be cast to int2
+        // skip = iacc * NCHAN_COARSE * NSAMP_PER_PACKET + blockIdx.x * NCHAN_PER_PACKET * NSAMP_PER_PACKET;
+
+        skip = blockIdx.x * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NCHAN_PER_PACKET * NSAMP_PER_PACKET;
+ 
+        for (int ichunk = 0; ichunk < 7; ++ichunk) {
+            line = ichunk * blockDim.x + threadIdx.x;
+            chan = line % 7;
+            time = line / 7;
+            tmp = ((int2*)in)[skip + line];
+            accblock[chan * NSAMP_PER_PACKET + time] = tmp.y;
+            accblock[NSAMP_PER_PACKET * NCHAN_PER_PACKET + chan * NSAMP_PER_PACKET + time] = tmp.x;
+        }
+
+        __syncthreads();
+ 
+        skip = NCHAN_COARSE * NSAMP_PER_PACKET * NACCUMULATE;
+ 
+        outskip = blockIdx.x * 7 * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET;
+
+        for (chan = 0; chan < NCHAN_PER_PACKET; ++chan) {
+            /*polaint = accblock[ichan * NSAMP_PER_PACKET + threadIdx.x];
+            polbint = accblock[NSAMP_PER_PACKET * NCHAN_PER_PACKET + ichan * NSAMP_PER_PACKET + threadIdx.x];
+            pola.x = static_cast<float>(static_cast<short>( ((polaint & 0xff000000) >> 24) | ((polaint & 0xff0000) >> 8) ));
+            pola.y = static_cast<float>(static_cast<short>( ((polaint & 0xff00) >> 8) | ((polaint & 0xff) << 8) ));
+
+            polb.x = static_cast<float>(static_cast<short>( ((polbint & 0xff000000) >> 24) | ((polbint & 0xff0000) >> 8) ));
+            polb.y = static_cast<float>(static_cast<short>( ((polbint & 0xff00) >> 8) | ((polbint & 0xff) << 8) ));
+            */
+
+            polint = accblock[chan * NSAMP_PER_PACKET + threadIdx.x];
+            cpol.x = static_cast<float>(static_cast<short>( ((polint & 0xff000000) >> 24) | ((polint & 0xff0000) >> 8) ));
+            cpol.y = static_cast<float>(static_cast<short>( ((polint & 0xff00) >> 8) | ((polint & 0xff) << 8) ));
+            out[outskip + threadIdx.x] = cpol;
+
+            polint = accblock[NSAMP_PER_PACKET * NCHAN_PER_PACKET + chan * NSAMP_PER_PACKET + threadIdx.x];
+            cpol.x = static_cast<float>(static_cast<short>( ((polint & 0xff000000) >> 24) | ((polint & 0xff0000) >> 8) ));
+            cpol.y = static_cast<float>(static_cast<short>( ((polint & 0xff00) >> 8) | ((polint & 0xff) << 8) ));
+
+            out[skip + outskip + threadIdx.x] = cpol;
+
+            outskip += NSAMP_PER_PACKET * NACCUMULATE;
+        }
+    }
+}
+
 __global__ void unpack_new_new(const unsigned int *__restrict__ in, cufftComplex * __restrict__ out)
 {
+
+
 
     int skip = 0;
 
@@ -123,15 +208,16 @@ __global__ void unpack_new_new(const unsigned int *__restrict__ in, cufftComplex
     int polid = (threadIdx.y * blockDim.x + threadIdx.x) >> 0x7;
     int pollane = (threadIdx.y * blockDim.x + threadIdx.x) & 0x7f;
 
+
     for (int iacc = 0; iacc < NACCUMULATE; ++iacc) {
 
-        skip = iacc * NCHAN_COARSE * NSAMP_PER_PACKET * NPOL + blockIdx.x * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NPOL;
+        skip = NPOL * (blockIdx.x * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NCHAN_PER_PACKET * NSAMP_PER_PACKET);
 
         for (int ichunk = 0; ichunk < NCHAN_PER_PACKET; ++ichunk) {
             line = ichunk * blockDim.y + threadIdx.y;
             ichan = line % 7;
             time = line / 7;
-            accblock[ichan * NSAMP_PER_PACKET * 2 + threadIdx.x * NSAMP_PER_PACKET + time] = in[skip + line * 2 + threadIdx.x];
+            accblock[threadIdx.x * NSAMP_PER_PACKET * NCHAN_PER_PACKET + ichan * NSAMP_PER_PACKET + time] = in[skip + line * 2 + threadIdx.x];
         }
 
         __syncthreads();
@@ -168,6 +254,7 @@ __global__ void unpack_alt(const unsigned int *__restrict__ in, cufftComplex * _
 
     int time = 0;
     int chan = 0;
+    int line = 0;
 
     cufftComplex pola, polb;
 
@@ -177,19 +264,23 @@ __global__ void unpack_alt(const unsigned int *__restrict__ in, cufftComplex * _
 
     // NOTE: That will leave last 224 lines unprocessed
     // This can fit in 7 full warps of 32
-    for (int iacc = 0; iacc < 112; ++iacc) {
+    for (int iacc = 0; iacc < 113; ++iacc) {
 
-        chan = threadIdx.x % 7;
-        time = threadIdx.x / 7;        
+        line = iacc * blockDim.y + threadIdx.y;
+
+        if (line < NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE) {
+
+        chan = threadIdx.y % 7;
+        time = threadIdx.y / 7;        
  
-        accblock[chan * 146 + time] = in[inskip + threadIdx.x * NPOL];
-        accblock[NCHAN_PER_PACKET * 146 + chan * 146 + time] = in[inskip + threadIdx.x * NPOL + 1];
+        accblock[chan * 146 + time] = in[inskip + threadIdx.y * NPOL];
+        accblock[NCHAN_PER_PACKET * 146 + chan * 146 + time] = in[inskip + threadIdx.y * NPOL + 1];
         inskip += 2044;
         
         __syncthreads();
 
-        polbint = accblock[threadIdx.x];
-        polaint = accblock[NCHAN_PER_PACKET * 146 + threadIdx.x];
+        polbint = accblock[threadIdx.y];
+        polaint = accblock[NCHAN_PER_PACKET * 146 + threadIdx.y];
 
         pola.x = static_cast<float>(static_cast<short>( ((polaint & 0xff000000) >> 24) | ((polaint & 0xff0000) >> 8) ));
         pola.y = static_cast<float>(static_cast<short>( ((polaint & 0xff00) >> 8) | ((polaint & 0xff) << 8) ));
@@ -197,18 +288,21 @@ __global__ void unpack_alt(const unsigned int *__restrict__ in, cufftComplex * _
         polb.x = static_cast<float>(static_cast<short>( ((polbint & 0xff000000) >> 24) | ((polbint & 0xff0000) >> 8) ));
         polb.y = static_cast<float>(static_cast<short>( ((polbint & 0xff00) >> 8) | ((polbint & 0xff) << 8) ));
 
-        chan = threadIdx.x / 146;
-        time = threadIdx.x % 146; 
+        chan = threadIdx.y / 146;
+        time = threadIdx.y % 146; 
 
         out[outskip + chan * NSAMP_PER_PACKET * NACCUMULATE + time] = pola;
         out[NCHAN_COARSE * NSAMP_PER_PACKET * NACCUMULATE + outskip + chan * NSAMP_PER_PACKET * NACCUMULATE + time] = polb;
         outskip += 146;
-    }
 
+        }
+    }
+/*
+    // This is soooo ugly
     if (threadIdx.x < 224) {
 
-        chan = threadIdx.x % 7;
-        time = threadIdx.x / 7;
+        chan = threadIdx.y % 7;
+        time = threadIdx.y / 7;
 
         accblock[chan * 32 + time] = in[inskip + threadIdx.x * NPOL];
         accblock[NCHAN_PER_PACKET * 32 + chan * 32 + time] = in[inskip + threadIdx.x * NPOL + 1];
@@ -229,9 +323,8 @@ __global__ void unpack_alt(const unsigned int *__restrict__ in, cufftComplex * _
 
         out[outskip + chan * NSAMP_PER_PACKET * NACCUMULATE + time] = pola;
         out[NCHAN_COARSE * NSAMP_PER_PACKET * NACCUMULATE + outskip + chan * NSAMP_PER_PACKET * NACCUMULATE + time] = polb;
-        printf("%i", threadIdx.x);
     }
-        
+*/        
 }
 
 __global__ void powertime_original(cuComplex* __restrict__ in,
@@ -411,6 +504,18 @@ __global__ void powertimefreq_new_hardcoded(
 int main()
 {
 
+    std::ifstream incodif("codif.dat", std::ios_base::binary);
+    size_t toread = 7 * 128 * 48 * 8;
+    unsigned char *mycodif = new unsigned char[toread];
+    
+    incodif.read(reinterpret_cast<char*>(mycodif), toread);
+
+    incodif.close();
+
+    thrust::device_vector<unsigned char> rawdata(mycodif, mycodif + toread); 
+
+    cout << (int)rawdata[0] << " " << (int)rawdata[1] << endl;
+
     unsigned char *rawbuffer = new unsigned char[7168 * 48 * NACCUMULATE];
     cudaArray *rawarray;
     cudaChannelFormatDesc cdesc;
@@ -431,7 +536,7 @@ int main()
     cudaTextureObject_t texObj = 0;
     cudaCreateTextureObject(&texObj, &rdesc, &tdesc, NULL);
 
-    thrust::device_vector<unsigned char> rawdata(7148 * 48 * NACCUMULATE);
+    //thrust::device_vector<unsigned char> rawdata(7148 * 48 * NACCUMULATE);
     thrust::device_vector<cuComplex> input(336*32*4*2*NACCUMULATE);
     thrust::device_vector<float> output(336*27*NACCUMULATE);
 
@@ -442,20 +547,31 @@ int main()
 
     dim3 unpackt(2, 128, 1);
     dim3 unpacka(1, 1024, 1);
+    dim3 unpackb(48, 2, 1);
 
     for (int ii=0; ii<1; ++ii) {
 
-        unpack_original_tex<<<rearrange_b, rearrange_t, 0>>>(texObj, thrust::raw_pointer_cast(input.data()), NACCUMULATE);
-        unpack_new<<<48, 128, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()), NACCUMULATE);
-        unpack_new_new<<<48, unpackt, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()));
-        unpack_alt<<<48, unpacka, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()));
-        powertime_original<<<48, 27, 0>>>(thrust::raw_pointer_cast(input.data()),
-        thrust::raw_pointer_cast(output.data()), 864, NSAMPS, NACCUMULATE);
-        powertime_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
-        powertime_new<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()),336,32,27,2,4);
+        //unpack_original_tex<<<rearrange_b, rearrange_t, 0>>>(texObj, thrust::raw_pointer_cast(input.data()), NACCUMULATE);
+        //unpack_new<<<48, 128, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()));
+        unpack_new_b<<<48, 128, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()));
+        //unpack_new_new<<<48, unpackt, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()));
+        //unpack_alt<<<48, unpacka, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()));
+        //powertime_original<<<48, 27, 0>>>(thrust::raw_pointer_cast(input.data()),
+        //thrust::raw_pointer_cast(output.data()), 864, NSAMPS, NACCUMULATE);
+        //powertime_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
+        //powertime_new<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()),336,32,27,2,4);
         gpuErrchk(cudaDeviceSynchronize());
         //powertimefreq_new_hardcoded<<<NACCUMULATE,1024,0>>>(thrust::raw_pointer_cast(input.data()),thrust::raw_pointer_cast(output.data()));
     }
 
-  gpuErrchk(cudaDeviceSynchronize());
+    thrust::host_vector<cufftComplex> unpacked = input;
+
+    std::ofstream outfile("unpacked.dat");
+
+    for (int isamp = 0; isamp < unpacked.size(); isamp++)
+        outfile << unpacked[isamp].x << " " << unpacked[isamp].y << endl;
+
+    outfile.close();
+
+    gpuErrchk(cudaDeviceSynchronize());
 }
