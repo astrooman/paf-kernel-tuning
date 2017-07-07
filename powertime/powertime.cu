@@ -87,7 +87,7 @@ __global__ void unpack_new(const unsigned int *__restrict__ in, cufftComplex * _
             time = line / 7;
             tmp = ((int2*)in)[skip + line];
             accblock[chan * NSAMP_PER_PACKET + time] = tmp.y;
-            accblock[NSAMP_PER_PACKET * NCHAN_PER_PACKET + chan * NSAMP_PER_PACKET + + time] = tmp.x;
+            accblock[NSAMP_PER_PACKET * NCHAN_PER_PACKET + chan * NSAMP_PER_PACKET + time] = tmp.x;
         }
 
         __syncthreads();
@@ -551,7 +551,7 @@ int main()
 
     for (int ii=0; ii<1; ++ii) {
 
-        //unpack_original_tex<<<rearrange_b, rearrange_t, 0>>>(texObj, thrust::raw_pointer_cast(input.data()), NACCUMULATE);
+        unpack_original_tex<<<rearrange_b, rearrange_t, 0>>>(texObj, thrust::raw_pointer_cast(input.data()), NACCUMULATE);
         //unpack_new<<<48, 128, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()));
         unpack_new_b<<<48, 128, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()));
         //unpack_new_new<<<48, unpackt, 0>>>(reinterpret_cast<unsigned int*>(thrust::raw_pointer_cast(rawdata.data())), thrust::raw_pointer_cast(input.data()));
@@ -568,9 +568,11 @@ int main()
 
     std::ofstream outfile("unpacked.dat");
 
-    for (int isamp = 0; isamp < unpacked.size(); isamp++)
-        outfile << unpacked[isamp].x << " " << unpacked[isamp].y << endl;
-
+    // NOTE: Saved in the order: Polarisation, FPGA, Time, First I then Q
+    for (int isamp = 0; isamp < unpacked.size(); isamp++) {
+        outfile << (static_cast<short>(unpacked[isamp].x) & 0x3) << " " << ((static_cast<short>(unpacked[isamp].x) & 0xfc00) >> 10) << " " << ((static_cast<short>(unpacked[isamp].x) & 0x03fc) >> 2)
+                << " " << (static_cast<short>(unpacked[isamp].y) & 0x3) << " " << ((static_cast<short>(unpacked[isamp].y) & 0xfc00) >> 10) << " " << ((static_cast<short>(unpacked[isamp].y) & 0x03fc) >> 2) << endl;
+    }
     outfile.close();
 
     gpuErrchk(cudaDeviceSynchronize());
