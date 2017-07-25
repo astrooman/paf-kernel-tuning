@@ -76,7 +76,6 @@ __global__ void DetectScrunchKernel(
                                             float* __restrict__ out  // TF <-- Filterbank order
                                             )
 {
-
   /**
    * This block is going to do 2 timesamples for all coarse channels.
    * The fine channels are dealt with by the lanes
@@ -88,35 +87,36 @@ __global__ void DetectScrunchKernel(
 
   int warp_idx = threadIdx.x >> 0x5;
   int lane_idx = threadIdx.x & 0x1f;
-
-  int pol_step = NCHAN_COARSE * NSAMPS * NCHAN_FINE_IN * NACCUMULATE;
-
+  int pol_offset = NCHAN_COARSE * NSAMPS * NCHAN_FINE_IN * NACCUMULATE;
+  int coarse_chan_offet = NACCUMULATE * NCHAN_FINE_IN * NSAMPS;
+  int block_offset = NCHAN_FINE_IN * NSAMPS_SUMMED * blockIdx.x;
   int nwarps_per_block = blockDim.x/warpSize;
 
-  int offset_into_coarse_chan = blockIdx.x * NCHAN_FINE_IN * NSAMPS_SUMMED;
-
-  //Drop first 3 fine channels and last two fine channels
+  //Drop first 3 fine channels and last 2 fine channels
   if ((lane_idx > 2) & (lane_idx < 30))
     {
-      // This warp
+      // This warp 
       // first sample in inner dimension = (32 * 2 * blockIdx.x)
-
-      // This warp will loop over coarse channels in steps of NWARPS per block
-      // coarse_chan_idx (0,335)
+      // This warp will loop over coarse channels in steps of NWARPS per block coarse_chan_idx (0,335)
 
       for (int coarse_chan_idx = warp_idx; coarse_chan_idx < NCHAN_COARSE; coarse_chan_idx += nwarps_per_block)
         {
           float real = 0.0f;
           float imag = 0.0f;
-          int coarse_chan_jump = NACCUMULATE * NCHAN_FINE_IN * NSAMPS * coarse_chan_idx + offset_into_coarse_chan + lane_idx;
+          int base_offset = coarse_chan_offet * coarse_chan_idx + block_offset + lane_idx;
+
           for (int pol_idx=0; pol_idx<NPOL; ++pol_idx)
             {
-              int offset = pol_step * pol_idx + coarse_chan_jump;
+              int offset = base_offset + pol_offset * pol_idx;
               for (int sample_idx=0; sample_idx<NSAMPS_SUMMED; ++sample_idx)
                 {
                   //Get first channel
-                  int read_idx = offset + sample_idx * NCHAN_FINE_IN;
-                  cuComplex val = in[read_idx];
+                  // IDX = NCHAN_COARSE * NSAMPS * NCHAN_FINE_IN * NACCUMULATE * pol_idx
+                  // + NACCUMULATE * NCHAN_FINE_IN * NSAMPS * coarse_chan_idx
+                  // + blockIdx.x * NCHAN_FINE_IN * NSAMPS_SUMMED
+                  // + NCHAN_FINE_IN * sample_idx
+                  // + lane_idx;
+                  cuComplex val = in[offset + NCHAN_FINE_IN * sample_idx];
                   real += val.x * val.x;
                   imag += val.y * val.y;
                 }
@@ -129,26 +129,22 @@ __global__ void DetectScrunchKernel(
 
   __syncthreads();
 
-  for (int start_chan=warp_idx*warpSize; start_chan < (NCHAN_FINE_OUT * NCHAN_COARSE - NCHAN_SUM); start_chan+=blockDim.x) // blockDim.x is multiple of 32
+  /** 
+   * Here each warp will reduce 32 channels into 2 channels
+   * The last warp will have a problem that there will only be 16 values to process
+   * 
+   */
+  if (threadIdx.x <  (NCHAN_FINE_OUT * NCHAN_COARSE / NCHAN_SUM))
     {
-      //float sum = freq_sum_buffer[start_chan];
-      // 4 because we are summing 16 channels in a warp reduce
-      for (int ii=0; ii<4; ++ii)
+      float sum = 0.0;
+      for (int chan_idx = threadIdx.x * NCHAN_SUM; chan_idx < (threadIdx.x+1) * NCHAN_SUM; ++chan_idx)
         {
-          if (lane_idx < warpSize-(1<<ii)-1)
-            {
-              freq_sum_buffer[start_chan+lane_idx] += freq_sum_buffer[start_chan + lane_idx + (1<<ii)];
-            }
+          sum += freq_sum_buffer[chan_idx];
         }
-      if (lane_idx & 0x0f)
-        {
-          int out_chan = (start_chan + lane_idx)/16;
-          out[NCHAN_FINE_OUT * NCHAN_COARSE / NCHAN_SUM * blockIdx.x + out_chan] = freq_sum_buffer[start_chan+lane_idx];
-        }
+      out[NCHAN_FINE_OUT * NCHAN_COARSE / NCHAN_SUM * blockIdx.x + threadIdx.x] = sum;
     }
   return;
 }
-
 
 int main(int argc, char *argv[])
 {
@@ -168,6 +164,7 @@ int main(int argc, char *argv[])
 
                 for (int ichan = 0; ichan < 7; ++ichan) {
 
+			
                     // polai = ((ifpga << 10) | (isamp << 2) | 0x0);
                     // polaq = ((ifpga << 10) | (isamp << 2) | 0x2);
                     // polbi = ((ifpga << 10) | (isamp << 2) | 0x1);
@@ -182,6 +179,16 @@ int main(int argc, char *argv[])
                     codifarray[(ifpga * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET * NCHAN_PER_PACKET + isamp * NCHAN_PER_PACKET + ichan) * 8 + 6] = 0;
                     codifarray[(ifpga * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET * NCHAN_PER_PACKET + isamp * NCHAN_PER_PACKET + ichan) * 8 + 7] = 0;
 
+                    if((ifpga == 0) && (ichan == 0)) {
+		        codifarray[(ifpga * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET * NCHAN_PER_PACKET + isamp * NCHAN_PER_PACKET + ichan) * 8 + 0] = 0;
+                        codifarray[(ifpga * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET * NCHAN_PER_PACKET + isamp * NCHAN_PER_PACKET + ichan) * 8 + 1] = 2;
+                        codifarray[(ifpga * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET * NCHAN_PER_PACKET + isamp * NCHAN_PER_PACKET + ichan) * 8 + 2] = 0;
+                        codifarray[(ifpga * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET * NCHAN_PER_PACKET + isamp * NCHAN_PER_PACKET + ichan) * 8 + 3] = 2;
+                        codifarray[(ifpga * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET * NCHAN_PER_PACKET + isamp * NCHAN_PER_PACKET + ichan) * 8 + 4] = 0;
+                        codifarray[(ifpga * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET * NCHAN_PER_PACKET + isamp * NCHAN_PER_PACKET + ichan) * 8 + 5] = 2;
+                        codifarray[(ifpga * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET * NCHAN_PER_PACKET + isamp * NCHAN_PER_PACKET + ichan) * 8 + 6] = 0;
+                        codifarray[(ifpga * NCHAN_PER_PACKET * NSAMP_PER_PACKET * NACCUMULATE + iacc * NSAMP_PER_PACKET * NCHAN_PER_PACKET + isamp * NCHAN_PER_PACKET + ichan) * 8 + 7] = 2;
+		    }
                 }
             }
         }
@@ -200,13 +207,40 @@ int main(int argc, char *argv[])
     cufftCheckError(cufftPlanMany(&fftplan, 1, sizes, NULL, 1, sizes[0], NULL, 1, sizes[0], CUFFT_C2C, 336 * NACCUMULATE * 4));
 
     float *detected;
-    cudaCheckError(cudaMalloc((void**)&detected, toread / 8 * sizeof(float)));
+    cudaCheckError(cudaMalloc((void**)&detected, NCHAN_COARSE * NCHAN_FINE_OUT / 16 * NACCUMULATE * 128 / 32 / NSAMPS_SUMMED * sizeof(float)));
+
+    std::cout << "Running the kernels..." << std::endl;
 
     UnpackKernel<<<48, 128, 0>>>(reinterpret_cast<int2*>(devdata), unpacked);
     cufftCheckError(cufftExecC2C(fftplan, unpacked, unpacked, CUFFT_FORWARD));
     DetectScrunchKernel<<<2 * NACCUMULATE, 1024, 0>>>(unpacked, detected);
 
     cudaCheckError(cudaDeviceSynchronize());
+
+    std::cout << "Copying the data back..." << std::endl;
+
+    float *dataarray = new float[NCHAN_COARSE * NCHAN_FINE_OUT / 16 * NACCUMULATE * 128 / 32 / NSAMPS_SUMMED];
+    cudaCheckError(cudaMemcpy(dataarray, detected, NCHAN_COARSE * NCHAN_FINE_OUT / 16 * NACCUMULATE * 128 / 32 / NSAMPS_SUMMED * sizeof(float), cudaMemcpyDeviceToHost));
+
+    std::ofstream outdata("detected.dat");
+
+    if (!outdata) {
+        std::cerr << "Could not create the output file!" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    for (int isamp = 0; isamp < NACCUMULATE * 128 / 32 / NSAMPS_SUMMED; ++isamp) {
+        for (int ichan = 0; ichan < NCHAN_COARSE * NCHAN_FINE_OUT / 16; ++ichan) {
+	    outdata << dataarray[isamp * NCHAN_COARSE * NCHAN_FINE_OUT / 16 + ichan] << " ";
+	}
+        outdata << std::endl;
+    }
+    outdata.close();
+    
+    delete [] dataarray;
+    cudaCheckError(cudaFree(detected));
+    cudaCheckError(cudaFree(devdata));
+    delete [] codifarray;
 
     return 0;
 
