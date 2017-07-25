@@ -15,6 +15,7 @@
 #define NACCUMULATE 128
 #define NPOL 2
 #define NSAMPS 4
+#define NSAMPS_SUMMED 2
 #define NCHAN_SUM 16
 #define NSAMP_PER_PACKET 128
 #define NCHAN_PER_PACKET 7
@@ -71,56 +72,83 @@ __global__ void UnpackKernel(int2 *__restrict__ in, cufftComplex *__restrict__ o
 }
 
 __global__ void DetectScrunchKernel(
-  cuComplex* __restrict__ in,
-  float* __restrict__ out)
+                                            cuComplex* __restrict__ in, // PFTF <-- FFT output order
+                                            float* __restrict__ out  // TF <-- Filterbank order
+                                            )
 {
 
-  __shared__ float freq_sum_buffer[NCHAN_FINE_OUT*NCHAN_COARSE];
+  /**
+   * This block is going to do 2 timesamples for all coarse channels.
+   * The fine channels are dealt with by the lanes
+   */
+
+  // gridDim.x should be Nacc * 128 / (32 * nsamps_to_add) == 256
+
+  __shared__ float freq_sum_buffer[NCHAN_FINE_OUT*NCHAN_COARSE]; // 9072 elements
 
   int warp_idx = threadIdx.x >> 0x5;
   int lane_idx = threadIdx.x & 0x1f;
 
-  if (lane_idx >= NCHAN_FINE_OUT)
-    return;
+  int pol_step = NCHAN_COARSE * NSAMPS * NCHAN_FINE_IN * NACCUMULATE;
 
-  int offset = blockIdx.x * NCHAN_COARSE * NPOL * NSAMPS * NCHAN_FINE_IN;
-  int out_offset = blockIdx.x * NCHAN_COARSE * NCHAN_FINE_OUT / NCHAN_SUM;
+  int nwarps_per_block = blockDim.x/warpSize;
 
-  for (int coarse_chan_idx = warp_idx; coarse_chan_idx < NCHAN_COARSE; coarse_chan_idx += warpSize)
+  int offset_into_coarse_chan = blockIdx.x * NCHAN_FINE_IN * NSAMPS_SUMMED;
+
+  //Drop first 3 fine channels and last two fine channels
+  if ((lane_idx > 2) & (lane_idx < 30))
     {
-      float real = 0.0f;
-      float imag = 0.0f;
-      int coarse_chan_offset = offset + coarse_chan_idx * NPOL * NSAMPS * NCHAN_FINE_IN;
+      // This warp
+      // first sample in inner dimension = (32 * 2 * blockIdx.x)
 
-      for (int pol=0; pol<NPOL; ++pol)
-      {
-        int pol_offset = coarse_chan_offset + pol * NSAMPS * NCHAN_FINE_IN;
-        for (int samp=0; samp<NSAMPS; ++samp)
+      // This warp will loop over coarse channels in steps of NWARPS per block
+      // coarse_chan_idx (0,335)
+
+      for (int coarse_chan_idx = warp_idx; coarse_chan_idx < NCHAN_COARSE; coarse_chan_idx += nwarps_per_block)
         {
-          int samp_offset = pol_offset + samp * NCHAN_FINE_IN;
-          cuComplex val = in[samp_offset + lane_idx];
-          real += val.x * val.x;
-          imag += val.y * val.y;
+          float real = 0.0f;
+          float imag = 0.0f;
+          int coarse_chan_jump = NACCUMULATE * NCHAN_FINE_IN * NSAMPS * coarse_chan_idx + offset_into_coarse_chan + lane_idx;
+          for (int pol_idx=0; pol_idx<NPOL; ++pol_idx)
+            {
+              int offset = pol_step * pol_idx + coarse_chan_jump;
+              for (int sample_idx=0; sample_idx<NSAMPS_SUMMED; ++sample_idx)
+                {
+                  //Get first channel
+                  int read_idx = offset + sample_idx * NCHAN_FINE_IN;
+                  cuComplex val = in[read_idx];
+                  real += val.x * val.x;
+                  imag += val.y * val.y;
+                }
+              // 3 is the leading dead lane count
+              // sketchy
+              freq_sum_buffer[coarse_chan_idx*NCHAN_FINE_OUT + lane_idx - 3] = real + imag;
+            }
         }
-      }
-      int output_idx = coarse_chan_idx * NCHAN_FINE_OUT + lane_idx;
+    }
 
-      freq_sum_buffer[output_idx] = real+imag; //scaling goes here
-      __syncthreads();
+  __syncthreads();
 
-      for (int start_chan=threadIdx.x; start_chan < (NCHAN_FINE_OUT * NCHAN_COARSE - NCHAN_SUM); start_chan+=blockDim.x)
-      {
-        float sum = freq_sum_buffer[start_chan];
-        for (int ii=0; ii<4; ++ii)
+  for (int start_chan=warp_idx*warpSize; start_chan < (NCHAN_FINE_OUT * NCHAN_COARSE - NCHAN_SUM); start_chan+=blockDim.x) // blockDim.x is multiple of 32
+    {
+      //float sum = freq_sum_buffer[start_chan];
+      // 4 because we are summing 16 channels in a warp reduce
+      for (int ii=0; ii<4; ++ii)
         {
-          sum += freq_sum_buffer[start_chan + (1<<ii)];
-          __syncthreads();
+          if (lane_idx < warpSize-(1<<ii)-1)
+            {
+              freq_sum_buffer[start_chan+lane_idx] += freq_sum_buffer[start_chan + lane_idx + (1<<ii)];
+            }
         }
-	out[out_offset+start_chan/NCHAN_SUM] = sum;
-      }
+      if (lane_idx & 0x0f)
+        {
+          int out_chan = (start_chan + lane_idx)/16;
+          out[NCHAN_FINE_OUT * NCHAN_COARSE / NCHAN_SUM * blockIdx.x + out_chan] = freq_sum_buffer[start_chan+lane_idx];
+        }
     }
   return;
 }
+
 
 int main(int argc, char *argv[])
 {
@@ -176,7 +204,9 @@ int main(int argc, char *argv[])
 
     UnpackKernel<<<48, 128, 0>>>(reinterpret_cast<int2*>(devdata), unpacked);
     cufftCheckError(cufftExecC2C(fftplan, unpacked, unpacked, CUFFT_FORWARD));
-    DetectScrunchKernel<<<NACCUMULATE, 1024, 0>>>(unpacked, detected);
+    DetectScrunchKernel<<<2 * NACCUMULATE, 1024, 0>>>(unpacked, detected);
+
+    cudaCheckError(cudaDeviceSynchronize());
 
     return 0;
 
